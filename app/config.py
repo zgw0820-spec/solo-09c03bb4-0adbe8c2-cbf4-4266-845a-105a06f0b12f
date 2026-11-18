@@ -36,6 +36,9 @@ class Settings:
     revalidate_ttl_s: int
     fetch_state_ttl_s: int
     publish_record_ttl_s: int
+    diagnostics_ttl_s: int
+    diagnostics_default_deadline_ms: int
+    diagnostics_reaper_interval_s: int
     instance_name: str
     public_instances: tuple[str, ...]
 
@@ -66,6 +69,13 @@ class Settings:
             fetch_state_ttl_s=_env_int("FETCH_STATE_TTL_S", 30, 5, 300),
             publish_record_ttl_s=_env_int(
                 "PUBLISH_RECORD_TTL_S", 604_800, 60, 2_592_000
+            ),
+            diagnostics_ttl_s=_env_int("DIAGNOSTICS_TTL_S", 600, 60, 86_400),
+            diagnostics_default_deadline_ms=_env_int(
+                "DIAGNOSTICS_DEFAULT_DEADLINE_MS", 15_000, 1_000, 300_000
+            ),
+            diagnostics_reaper_interval_s=_env_int(
+                "DIAGNOSTICS_REAPER_INTERVAL_S", 5, 1, 300
             ),
             instance_name=_env_str("INSTANCE_NAME", "query"),
             public_instances=instances,

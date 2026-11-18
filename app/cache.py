@@ -520,12 +520,18 @@ class TagService:
                 await self._stat("origin_errors")
                 message = f"源站查询 {tag} 超时（>{self.s.origin_timeout_ms}ms），请重试"
                 await self._record_fetch_error(tag, write_token, "origin_timeout", message, 504, True)
-                raise ServiceError("origin_timeout", message, 504, retryable=True) from exc
+                raise ServiceError(
+                    "origin_timeout", message, 504, retryable=True,
+                    extra={"origin_called": True},
+                ) from exc
             except httpx.HTTPError as exc:
                 await self._stat("origin_errors")
                 message = f"无法连接源站（{exc.__class__.__name__}），请重试"
                 await self._record_fetch_error(tag, write_token, "origin_unreachable", message, 502, True)
-                raise ServiceError("origin_unreachable", message, 502, retryable=True) from exc
+                raise ServiceError(
+                    "origin_unreachable", message, 502, retryable=True,
+                    extra={"origin_called": True},
+                ) from exc
 
             if response.status_code == 404:
                 await self._stat("origin_errors")
@@ -533,7 +539,10 @@ class TagService:
                 await self._record_fetch_error(
                     tag, write_token, "tag_not_found", message, 404, False, 404
                 )
-                raise ServiceError("tag_not_found", message, 404, retryable=False)
+                raise ServiceError(
+                    "tag_not_found", message, 404, retryable=False,
+                    extra={"origin_called": True},
+                )
             if response.status_code >= 400:
                 await self._stat("origin_errors")
                 message = f"源站返回 HTTP {response.status_code}，请重试"
@@ -545,7 +554,7 @@ class TagService:
                     message,
                     502,
                     retryable=True,
-                    extra={"origin_status": response.status_code},
+                    extra={"origin_status": response.status_code, "origin_called": True},
                 )
 
             try:
@@ -561,7 +570,8 @@ class TagService:
                     tag, write_token, "origin_bad_response", message, 502, True
                 )
                 raise ServiceError(
-                    "origin_bad_response", message, 502, retryable=True
+                    "origin_bad_response", message, 502, retryable=True,
+                    extra={"origin_called": True},
                 ) from exc
 
             now = _now_ms()

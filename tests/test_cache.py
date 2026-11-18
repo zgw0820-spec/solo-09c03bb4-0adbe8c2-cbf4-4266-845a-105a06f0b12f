@@ -89,6 +89,9 @@ def make_settings(**overrides) -> Settings:
         "revalidate_ttl_s": 300,
         "fetch_state_ttl_s": 30,
         "publish_record_ttl_s": 1000,
+        "diagnostics_ttl_s": 600,
+        "diagnostics_default_deadline_ms": 2000,
+        "diagnostics_reaper_interval_s": 1,
         "instance_name": "test",
         "public_instances": ("http://a", "http://b"),
     }

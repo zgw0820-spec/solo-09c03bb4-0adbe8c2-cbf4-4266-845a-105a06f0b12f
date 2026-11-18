@@ -228,6 +228,35 @@
     <h2>本轮查询明细</h2>
     <div id="detailWrap"><span class="muted">尚无查询结果</span></div>
   </section>
+
+  <section class="wide">
+    <h2>查询轮次诊断</h2>
+    <div class="stack">
+      <div class="row">
+        <div class="field">
+          <label for="diagTag">诊断标签</label>
+          <input id="diagTag" value="v1.0.0" autocomplete="off" />
+        </div>
+        <div class="field small">
+          <label for="diagPerInstance">每实例请求数（轮次上限 16）</label>
+          <input id="diagPerInstance" type="number" min="1" max="8" value="4" />
+        </div>
+        <div class="field small">
+          <label for="diagDeadline">截止时间 (ms)</label>
+          <input id="diagDeadline" type="number" min="500" max="120000" step="100" value="15000" />
+        </div>
+      </div>
+      <div class="row">
+        <button class="primary" id="diagRunBtn">新建轮次并双实例并发查询</button>
+        <button id="diagListBtn" class="ghost">刷新轮次列表</button>
+        <span class="pill">记录保留 10 分钟 · 每轮最多 16 个请求</span>
+      </div>
+      <div class="hint">新建轮次会在启动前固定每个请求的编号、实例与令牌，以及整轮截止时间；查询结束或截止到达后轮次封存，未上报的请求记为缺口，迟到结果单独展示且不能改写封存结论。同标签重试会另建轮次。</div>
+      <div id="diagSummary"></div>
+      <div id="diagListWrap"><span class="muted">尚无轮次</span></div>
+      <div id="diagDetailWrap"></div>
+    </div>
+  </section>
 </main>
 
 <div class="toast" id="toast"></div>
@@ -517,10 +546,172 @@
   $("invalidateBtn").addEventListener("click", invalidate);
   $("statusBtn").addEventListener("click", refreshStatus);
 
+  // ------------------------------------------------- query-round diagnostics
+  const diagState = { current: null, timer: null };
+
+  function roleBadge(role) {
+    const map = { leader: ["回源", "tag-warn"], follower: ["等待", "tag-ok"], cache: ["命中", "tag-ok"] };
+    const [text, cls] = map[role] || [role || "—", "muted"];
+    return `<span class="${cls}">${esc(text)}</span>`;
+  }
+
+  function renderDiagList(rounds) {
+    if (!rounds.length) {
+      $("diagListWrap").innerHTML = `<span class="muted">该标签最近 10 分钟没有轮次</span>`;
+      return;
+    }
+    const rows = rounds.map((r) => {
+      const stateCls = r.status === "sealed" ? (r.complete ? "tag-ok" : "tag-warn") : "";
+      return `<tr style="cursor:pointer" data-round="${esc(r.round_id)}">
+        <td class="mono">${esc(r.round_id.slice(0, 13))}…</td>
+        <td class="${stateCls}">${esc(r.status)}${r.seal_reason ? ` (${esc(r.seal_reason)})` : ""}</td>
+        <td>${esc(r.planned_count)}</td>
+        <td class="${r.gap_count ? "tag-bad" : "tag-ok"}">${esc(r.gap_count)}</td>
+        <td class="mono">${esc(r.created_at || "")}</td>
+        <td class="mono">${esc(r.deadline || "")}</td>
+      </tr>`;
+    }).join("");
+    $("diagListWrap").innerHTML = `
+      <table>
+        <thead><tr><th>轮次</th><th>状态</th><th>计划请求</th><th>缺口</th><th>创建于</th><th>截止</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+    $("diagListWrap").querySelectorAll("tr[data-round]").forEach((tr) => {
+      tr.addEventListener("click", () => openDiagRound(tr.dataset.round));
+    });
+  }
+
+  async function loadDiagList(tag) {
+    const { ok, body, status } = await fetchJson(`/api/diagnostics/rounds?tag=${encodeURIComponent(tag)}&limit=20`);
+    if (!ok) { toast(`轮次列表读取失败：${errText(body, status)}`, "err"); return; }
+    renderDiagList(body.rounds || []);
+  }
+
+  function renderDiagDetail(doc) {
+    const sealed = doc.status === "sealed";
+    const conclusion = doc.conclusion || {};
+    const slotRows = doc.slots.map((s) => {
+      if (s.status === "gap") {
+        return `<tr>
+          <td>${esc(s.slot)}</td>
+          <td>${esc(s.instance || "—")}</td>
+          <td><span class="tag-bad">缺口</span></td>
+          <td colspan="5" class="muted">${esc(s.note || "封存时未上报")}</td></tr>`;
+      }
+      const failed = s.result === "error";
+      return `<tr>
+        <td>${esc(s.slot)}</td>
+        <td>${esc(s.instance || "—")}</td>
+        <td>${roleBadge(s.role)}</td>
+        <td class="${failed ? "tag-bad" : "tag-ok"}">${failed ? esc(s.error_code || "error") : "成功"}</td>
+        <td class="mono">${esc(s.digest || "—")}</td>
+        <td class="mono">${esc(s.observed_generation ?? "—")}${s.fenced_by_publish ? ' <span class="tag-warn">发布抢先</span>' : ""}${s.stale_due_to_pending ? ' <span class="tag-warn">旧值</span>' : ""}</td>
+        <td>${s.origin_called ? '<span class="tag-warn">回源</span>' : "—"}</td>
+        <td class="mono">${esc(s.duration_ms ?? "—")}ms</td>
+      </tr>`;
+    }).join("");
+    const lateRows = (doc.late_reports || []).map((s) => `<tr>
+        <td>${esc(s.slot)}</td><td>${esc(s.instance || "—")}</td>
+        <td>${roleBadge(s.role)}</td>
+        <td class="${s.result === "error" ? "tag-bad" : "tag-ok"}">${s.result === "error" ? esc(s.error_code || "error") : "成功（迟到）"}</td>
+        <td class="mono">${esc(s.digest || "—")}</td>
+        <td class="mono">${esc(s.observed_generation ?? "—")}</td>
+        <td>${s.origin_called ? '<span class="tag-warn">回源</span>' : "—"}</td>
+        <td class="mono">${esc(s.duration_ms ?? "—")}ms</td></tr>`).join("");
+    const c = conclusion;
+    $("diagDetailWrap").innerHTML = `
+      <div class="cards" style="margin:10px 0">
+        <div class="card"><div class="k">轮次状态</div><div class="v ${sealed ? (doc.complete ? "tag-ok" : "tag-warn") : ""}">${esc(doc.status)}${doc.seal_reason ? ` · ${esc(doc.seal_reason)}` : ""}</div></div>
+        <div class="card"><div class="k">计划 / 已记录 / 缺口</div><div class="v">${esc(doc.planned_count)} / ${esc((c.recorded ?? 0))} / <span class="${doc.gap_count ? "tag-bad" : "tag-ok"}">${esc(doc.gap_count)}</span></div></div>
+        <div class="card"><div class="k">角色分布</div><div class="v mono">${esc(JSON.stringify(c.roles || {}))}</div></div>
+        <div class="card"><div class="k">实际回源</div><div class="v">${esc(c.origin_called ?? 0)}</div></div>
+        <div class="card"><div class="k">结果分布</div><div class="v mono">${esc(JSON.stringify(c.results || {}))}</div></div>
+        <div class="card"><div class="k">观察到的代号</div><div class="v mono">${esc(JSON.stringify(c.observed_generations || []))}</div></div>
+        <div class="card"><div class="k">摘要一致</div><div class="v ${c.digest_consistent ? "tag-ok" : "tag-bad"}">${c.digest_consistent ? "是" : "否"}</div></div>
+        <div class="card"><div class="k">迟到结果</div><div class="v ${doc.late_reports.length ? "tag-warn" : ""}">${esc(doc.late_reports.length)}</div></div>
+      </div>
+      <table>
+        <thead><tr><th>编号</th><th>实例</th><th>角色</th><th>结果</th><th>摘要</th><th>发布代号</th><th>回源</th><th>耗时</th></tr></thead>
+        <tbody>${slotRows}</tbody>
+      </table>
+      ${doc.late_reports.length ? `<h2 style="margin:14px 0 8px">迟到结果（不参与封存结论）</h2>
+        <table><thead><tr><th>编号</th><th>实例</th><th>角色</th><th>结果</th><th>摘要</th><th>发布代号</th><th>回源</th><th>耗时</th></tr></thead>
+        <tbody>${lateRows}</tbody></table>` : ""}
+      <div class="hint">轮次 <code>${esc(doc.round_id)}</code> · 标签 <code>${esc(doc.tag)}</code> · 封存于 ${esc(doc.sealed_at || "—")} · 截止 ${esc(doc.deadline || "—")} · 缺口在封存时固定，迟到结果不能填补。</div>`;
+  }
+
+  async function openDiagRound(roundId) {
+    const { ok, body, status } = await fetchJson(`/api/diagnostics/rounds/${encodeURIComponent(roundId)}`);
+    if (!ok) { toast(`轮次详情读取失败：${errText(body, status)}`, "err"); return; }
+    diagState.current = body;
+    renderDiagDetail(body);
+  }
+
+  async function runDiagnosticRound() {
+    const tag = $("diagTag").value.trim();
+    if (!tag) { toast("诊断标签不能为空", "err"); return; }
+    const perInstance = Math.max(1, Math.min(8, parseInt($("diagPerInstance").value, 10) || 4));
+    const entries = [];
+    for (const instance of state.instances) {
+      for (let i = 0; i < perInstance; i += 1) entries.push({ instance: instance.name.replace(" (当前)", "") });
+    }
+    if (entries.length > 16) {
+      toast(`每轮最多 16 个请求（当前 ${entries.length}），已截断`, "err");
+      entries.length = 16;
+    }
+    const deadlineMs = Date.now() + Math.max(500, Math.min(120000, parseInt($("diagDeadline").value, 10) || 15000));
+    $("diagRunBtn").disabled = true;
+    $("diagSummary").innerHTML = `<span class="muted">正在创建轮次（${entries.length} 个请求）…</span>`;
+    try {
+      const created = await fetchJson("/api/diagnostics/rounds", {
+        method: "POST",
+        body: JSON.stringify({ tag, entries, deadline_ms: deadlineMs }),
+      });
+      if (!created.ok) {
+        $("diagSummary").innerHTML = `<span class="tag-bad">轮次创建失败：${esc(errText(created.body, created.status))}</span>`;
+        return;
+      }
+      const doc = created.body;
+      const creds = {};
+      for (const c of doc.credentials || []) creds[c.slot] = c.token;
+      $("diagSummary").innerHTML = `<span class="muted">轮次 ${esc(doc.round_id.slice(0, 13))}… 已创建，${doc.planned_count} 个请求并发中，截止 ${esc(doc.deadline)}…</span>`;
+      const byName = new Map(state.instances.map((i) => [i.name.replace(" (当前)", ""), i]));
+      const jobs = doc.plan.map((slot) => {
+        const target = byName.get(slot.instance) || state.instances[0];
+        const started = performance.now();
+        return fetchJson(`${target.url}/api/tag/${encodeURIComponent(tag)}`, {
+          headers: {
+            "X-Diag-Round": doc.round_id,
+            "X-Diag-Slot": String(slot.slot),
+            "X-Diag-Token": creds[slot.slot],
+          },
+        }).then((r) => ({ ...r, slot: slot.slot, ms: Math.round(performance.now() - started) }));
+      });
+      const responses = await Promise.all(jobs);
+      const okCount = responses.filter((r) => r.ok).length;
+      const errCount = responses.length - okCount;
+      $("diagSummary").innerHTML = `<div class="hint">轮次查询结束：${okCount} 成功 / ${errCount} 错误，等待封存与详情…</div>`;
+      await openDiagRound(doc.round_id);
+      toast(`轮次 ${doc.round_id.slice(0, 8)}… 完成：${okCount} 成功${errCount ? `，${errCount} 错误` : ""}`, errCount ? "err" : "ok");
+      await loadDiagList(tag);
+      refreshStats();
+    } finally {
+      $("diagRunBtn").disabled = false;
+    }
+  }
+
+  $("diagRunBtn").addEventListener("click", () => runDiagnosticRound().catch((e) => toast(String(e), "err")));
+  $("diagListBtn").addEventListener("click", () => loadDiagList($("diagTag").value.trim()).catch((e) => toast(String(e), "err")));
+
   $("pubRequestId").value = newRequestId();
-  loadConfig().then(() => { refreshStatus(); refreshStats(); });
+  loadConfig().then(() => { refreshStatus(); refreshStats(); loadDiagList($("diagTag").value.trim()); });
   health();
   setInterval(() => { health(); refreshStats(); }, 5000);
+  setInterval(() => {
+    if (diagState.current && diagState.current.status !== "sealed") {
+      openDiagRound(diagState.current.round_id).catch(() => {});
+    }
+  }, 1500);
 })();
 </script>
 </body>
